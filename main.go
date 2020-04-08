@@ -14,9 +14,15 @@ package main
 
 import (
 	"errors"
+	"fmt"
+	"io/ioutil"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"net/http"
+	"os"
 
-	"github.com/eclipse/che-go-jsonrpc"
+	jsonrpc "github.com/eclipse/che-go-jsonrpc"
 	"github.com/eclipse/che-go-jsonrpc/jsonrpcws"
 	"github.com/eclipse/che-machine-exec/api/events"
 	execRpc "github.com/eclipse/che-machine-exec/api/jsonrpc"
@@ -26,6 +32,11 @@ import (
 	"github.com/eclipse/che-machine-exec/cfg"
 	"github.com/gin-gonic/gin"
 	"github.com/sirupsen/logrus"
+)
+
+const (
+	namespaceFile = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+	WsIdLabel     = "che.workspace_id"
 )
 
 func main() {
@@ -51,6 +62,18 @@ func main() {
 				logrus.Debug(err)
 				c.JSON(c.Writer.Status(), err.Error())
 				return
+			}
+			username := c.Request.Header.Get("X-Forwarded-User")
+			logrus.Info(fmt.Sprintf("User connecting: %s", username))
+			if len(username) == 0 {
+				logrus.Warn("Could not get username on request")
+			} else {
+				if !checkUsername(username) {
+					err := errors.New("username in request does not match owner")
+					logrus.Debug(err)
+					c.JSON(c.Writer.Status(), err.Error())
+					return
+				}
 			}
 		}
 
@@ -91,4 +114,52 @@ func main() {
 	if err := r.Run(cfg.URL); err != nil {
 		logrus.Fatal("Unable to start server. Cause: ", err.Error())
 	}
+}
+
+func checkUsername(username string) bool {
+	if len(username) == 0 {
+		logrus.Debug("Failed to create k8sAPI. Token must not be empty")
+		return false
+	}
+
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		logrus.Debug(err)
+		return false
+	}
+
+	client, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		logrus.Debug(err)
+		return false
+	}
+
+	workspaceID := os.Getenv("CHE_WORKSPACE_ID")
+	if workspaceID == "" {
+		err := errors.New("unable to get current workspace id")
+		logrus.Debug(err)
+		return false
+	}
+
+	filterOptions := metav1.ListOptions{LabelSelector: WsIdLabel + "=" + workspaceID, FieldSelector: "status.phase=Running"}
+	wsPods, err := client.CoreV1().Pods(readNamespace()).List(filterOptions)
+	if err != nil {
+		logrus.Debug(err)
+		return false
+	}
+	for _, pod := range wsPods.Items {
+		if pod.Annotations["org.eclipse.che.workspace/user"] == username {
+			logrus.Info("User matches annotation, continuing")
+			return true
+		}
+	}
+	return false
+}
+
+func readNamespace() string {
+	nsBytes, err := ioutil.ReadFile(namespaceFile)
+	if err != nil {
+		logrus.Fatal("Failed to get Namespace", err)
+	}
+	return string(nsBytes)
 }
